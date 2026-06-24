@@ -76,6 +76,18 @@ async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+    log.info("Получено сообщение от chat_id=%s: %s", chat_id, text)
+
+    try:
+        await _handle_message_inner(update, context, chat_id, text)
+    except Exception:
+        log.exception("Ошибка при обработке сообщения от chat_id=%s", chat_id)
+        await update.message.reply_text(
+            "Что-то пошло не так при обработке — попробуй ещё раз через минуту 🙏"
+        )
+
+
+async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
 
     # Случай 1: ждём подтверждения гипотезы (да/нет на предложенный вариант).
     if chat_id in AWAITING_HYPOTHESIS_CONFIRM:
