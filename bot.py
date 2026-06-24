@@ -170,7 +170,7 @@ def main():
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("список", list_tasks_command))
+    application.add_handler(CommandHandler("list", list_tasks_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Список ваших chat_id для рассылки. Сейчас бот один на один с вами —
