@@ -61,14 +61,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟣"}
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, None: 3}
+PRIORITY_LABEL = {"high": "Высокий приоритет", "medium": "Средний приоритет", "low": "Низкий приоритет", None: "Без приоритета"}
+
+
 async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tasks = db.get_open_tasks(chat_id)
     if not tasks:
         await update.message.reply_text("Сейчас открытых задач нет 🎉")
         return
-    lines = [f"{i+1}. {t['text']} [{t.get('priority') or 'без приоритета'}]" for i, t in enumerate(tasks)]
-    await update.message.reply_text("\n".join(lines))
+
+    # Сортируем: сначала high, потом medium, потом low, потом без приоритета.
+    tasks_sorted = sorted(tasks, key=lambda t: PRIORITY_ORDER.get(t.get("priority"), 3))
+
+    blocks = []
+    current_priority = object()  # заведомо не совпадёт с первой задачей
+    block_lines = []
+    counter = 1
+    for t in tasks_sorted:
+        priority = t.get("priority")
+        if priority != current_priority:
+            if block_lines:
+                blocks.append("\n".join(block_lines))
+            current_priority = priority
+            emoji = PRIORITY_EMOJI.get(priority, "⚪️")
+            block_lines = [f"{emoji} *{PRIORITY_LABEL.get(priority, 'Без приоритета')}*"]
+        block_lines.append(f"{counter}. {t['text']}")
+        counter += 1
+    if block_lines:
+        blocks.append("\n".join(block_lines))
+
+    text = "\n\n".join(blocks)  # пустая строка = отступ между группами приоритетов
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ---------- Обработка обычных сообщений ----------
@@ -119,12 +145,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     lowered = text.lower()
     if lowered.startswith("сделал") or lowered.startswith("готово") or lowered.startswith("выполнил"):
         open_tasks = db.get_open_tasks(chat_id)
-        # Простое сопоставление: ищем задачу, чей текст частично совпадает с сообщением.
-        match = None
-        for t in open_tasks:
-            if t["text"].lower() in lowered or any(word in lowered for word in t["text"].lower().split()[:3]):
-                match = t
-                break
+        if not open_tasks:
+            await update.message.reply_text("Сейчас в списке нет открытых задач 🤷")
+            return
+        match = await ai.match_done_task(text, open_tasks)
         if match:
             db.mark_task_done(match["id"])
             await update.message.reply_text(f"Отлично, отметила «{match['text']}» как выполненную ✅")
