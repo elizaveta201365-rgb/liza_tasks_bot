@@ -14,7 +14,7 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Бесплатная модель с хорошим качеством рассуждений.
-MODEL = "deepseek/deepseek-r1:free"
+MODEL = "openrouter/free"
 
 
 async def ask_ai(system_prompt: str, user_prompt: str) -> str:
