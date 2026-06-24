@@ -13,7 +13,10 @@ import httpx
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Бесплатная модель с хорошим качеством рассуждений.
+# Универсальный "роутер" — сам выбирает доступную бесплатную модель.
+# Это надёжнее, чем привязываться к одной конкретной модели: конкретные
+# бесплатные модели на OpenRouter periodически снимаются с бесплатного
+# доступа без предупреждения, а роутер сам подберёт замену.
 MODEL = "openrouter/free"
 
 
@@ -110,6 +113,34 @@ async def propose_hypothesis(task_text: str, first_answer: str) -> dict:
         '"estimate_minutes" (число), "priority" ("high"/"medium"/"low").'
     )
     return await ask_ai_json(system_prompt, user_prompt)
+
+
+async def match_done_task(user_message: str, open_tasks: list[dict]) -> dict | None:
+    """
+    Пользователь написал что-то вроде 'сделала отчёт по Avito' (возможно,
+    сократив название задачи). Нужно понять, какую именно задачу из списка
+    открытых он закрыл — или None, если совпадения нет.
+    """
+    tasks_list = "\n".join(f"{t['id']}: «{t['text']}»" for t in open_tasks)
+
+    system_prompt = (
+        "Пользователь сообщает, что закрыл какую-то задачу, возможно, сократив или "
+        "переформулировав её название. Определи, какой задаче из списка соответствует "
+        "его сообщение. Если уверенного совпадения нет — верни null."
+    )
+    user_prompt = (
+        f"Открытые задачи (id: текст):\n{tasks_list}\n\n"
+        f"Сообщение пользователя: «{user_message}»\n\n"
+        'Ответь в формате JSON: {"task_id": число или null}'
+    )
+    result = await ask_ai_json(system_prompt, user_prompt)
+    task_id = result.get("task_id")
+    if task_id is None:
+        return None
+    for t in open_tasks:
+        if t["id"] == task_id:
+            return t
+    return None
 
 
 async def build_daily_summary(tasks: list[dict], pending_questions: list[dict]) -> str:
