@@ -1,20 +1,22 @@
 """
-bot.py — основная логика телеграм-бота для управления рабочими задачами.
+bot.py — простой телеграм-бот для рабочих задач.
 
-Сценарий работы:
-- Пользователь пишет задачу обычным текстом.
-- Бот через нейросеть решает: достаточно ли информации, или нужно уточнение.
-- Если нужно уточнение — задаёт один вопрос. Если ответ всё равно расплывчатый —
-  предлагает свою гипотезу для подтверждения.
-- Каждый будний день в 11:00 (по часовому поясу пользователя, см. TIMEZONE)
-  бот сам присылает сводку: сначала напоминания про незакрытые вопросы,
-  потом список задач с приоритетом и рекомендацией, с чего начать.
-- Пользователь пишет "сделала <текст>" чтобы отметить задачу выполненной.
+Логика двух «команд» (по первому слову сообщения):
+- Сообщение начинается со слова «задача» → бот ДОБАВЛЯЕТ задачу.
+  Приоритет можно сказать прямо в задаче словом «высокий», «средний»
+  или «низкий» (можно с «приоритет»). Не сказала — задача без приоритета.
+- Сообщение начинается со слова «сделала» (или «выполнила», «готово»,
+  «закрыла») → бот ЗАКРЫВАЕТ подходящую задачу, находя её по словам.
+- Любое другое сообщение бот за задачу НЕ принимает, а мягко подсказывает,
+  как добавить или закрыть.
+
+Приоритеты в списке: 🔴 высокий, 🟡 средний, 🟣 низкий, ⚪️ без приоритета.
+Команда /list — показать список. Вт–пт в 11:00 — автоматическая рассылка.
 """
 
 import os
+import re
 import logging
-from datetime import time
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -29,7 +31,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import database as db
-import ai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -37,33 +38,126 @@ log = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Moscow")
 
-# Простая "память в рамках сессии": какой задаче сейчас задан уточняющий вопрос,
-# чтобы понять, что следующее сообщение пользователя — это ответ на него.
-# Формат: {chat_id: task_id}
-AWAITING_ANSWER: dict[int, int] = {}
-# Если уже была одна попытка уточнения и мы предложили гипотезу — ждём да/нет.
-AWAITING_HYPOTHESIS_CONFIRM: dict[int, int] = {}
+PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟣", None: "⚪️"}
+PRIORITY_LABEL = {
+    "high": "Высокий приоритет",
+    "medium": "Средний приоритет",
+    "low": "Низкий приоритет",
+    None: "Без приоритета",
+}
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, None: 3}
+
+# Команда «добавить»: сообщение начинается с этого слова.
+ADD_PREFIX = re.compile(r"^\s*задач\w*\s*[:,\-—]?\s*", re.IGNORECASE)
+
+# Команда «закрыть»: прошедшее время «сделала/выполнила/готово/закрыла».
+# Важно: «сделать»/«закрыть» (что НУЖНО сделать) сюда не попадают.
+DONE_STEMS = ("сделал", "сделан", "выполнил", "выполнен", "готов", "закрыл", "закрыт")
+DONE_PREFIX = re.compile(r"^\s*(сделал\w*|выполнил\w*|готов\w*|закрыл\w*)\b", re.IGNORECASE)
+
+# Слова, которые не помогают опознать задачу при поиске по словам.
+STOPWORDS = {"задача", "задачу", "это", "уже", "там", "для", "под", "над", "про"}
+
+
+# ---------- Приоритет ----------
+
+def extract_priority(text: str):
+    """Достаёт приоритет и убирает слова про приоритет из текста задачи."""
+    lowered = text.lower()
+    priority = None
+    if re.search(r"высок", lowered):
+        priority = "high"
+    elif re.search(r"средн", lowered):
+        priority = "medium"
+    elif re.search(r"низк", lowered):
+        priority = "low"
+    clean = re.sub(
+        r"\s*(высок\w*|средн\w*|низк\w*)\s*(приоритет\w*)?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(r"\s+", " ", clean).strip(" .,-—:")
+    return priority, (clean or text.strip())
+
+
+# ---------- Поиск задачи для закрытия ----------
+
+def significant_words(text: str) -> list[str]:
+    words = re.findall(r"\w+", text.lower())
+    return [
+        w for w in words
+        if len(w) >= 3 and w not in STOPWORDS and not w.startswith(DONE_STEMS)
+    ]
+
+
+def word_matches(a: str, b: str) -> bool:
+    """Считает слова совпавшими, прощая русские окончания
+    (проанализировать ↔ проанализировала, сайт ↔ сайта)."""
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if long.startswith(short) and len(short) >= 4:
+        return True
+    common = 0
+    for x, y in zip(a, b):
+        if x == y:
+            common += 1
+        else:
+            break
+    return common >= 5
+
+
+def find_done_task(message: str, open_tasks: list[dict]) -> dict | None:
+    msg_words = significant_words(message)
+    if not msg_words:
+        return None
+    best, best_score = None, 0
+    for t in open_tasks:
+        task_words = significant_words(t["text"])
+        score = sum(
+            1 for tw in task_words if any(word_matches(tw, mw) for mw in msg_words)
+        )
+        if score > best_score:
+            best, best_score = t, score
+    return best if best_score >= 1 else None
+
+
+# ---------- Формат списка ----------
+
+def format_task_list(tasks: list[dict]) -> str:
+    tasks_sorted = sorted(tasks, key=lambda t: PRIORITY_ORDER.get(t.get("priority"), 3))
+    blocks, block_lines, current = [], [], object()
+    counter = 1
+    for t in tasks_sorted:
+        priority = t.get("priority")
+        if priority != current:
+            if block_lines:
+                blocks.append("\n".join(block_lines))
+            current = priority
+            emoji = PRIORITY_EMOJI.get(priority, "⚪️")
+            block_lines = [f"{emoji} *{PRIORITY_LABEL.get(priority, 'Без приоритета')}*"]
+        block_lines.append(f"{counter}. {t['text']}")
+        counter += 1
+    if block_lines:
+        blocks.append("\n".join(block_lines))
+    return "\n\n".join(blocks)
 
 
 # ---------- Команды ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "Привет! Я помогу разбирать рабочие задачи и каждое утро буду присылать "
-        "список с приоритетами.\n\n"
-        "Просто пиши мне задачи текстом — я сам разберусь, понятно сформулировано "
-        "или нужно уточнить детали.\n\n"
-        "Когда задача сделана — напиши, например: «сделала отчёт по Avito».\n\n"
-        f"(Технический момент: твой chat_id — {chat_id}. Его нужно один раз "
-        "вписать в Railway в переменную ALLOWED_CHAT_ID, чтобы заработала "
-        "утренняя рассылка.)"
+        "Привет! Я храню твои рабочие задачи.\n\n"
+        "• Добавить — начни сообщение со слова «задача»:\n"
+        "  «задача проанализировать конкурентов высокий приоритет».\n"
+        "• Приоритет — слово высокий / средний / низкий внутри задачи "
+        "(не скажешь — запишу без приоритета).\n"
+        "• Закрыть — начни со слова «сделала» и пару слов из задачи:\n"
+        "  «сделала проанализировала конкурентов».\n"
+        "• /list — показать все задачи.\n\n"
+        "Каждый будний день (вт–пт) в 11:00 пришлю список на день 🙂"
     )
-
-
-PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟣"}
-PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, None: 3}
-PRIORITY_LABEL = {"high": "Высокий приоритет", "medium": "Средний приоритет", "low": "Низкий приоритет", None: "Без приоритета"}
 
 
 async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,134 +166,78 @@ async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not tasks:
         await update.message.reply_text("Сейчас открытых задач нет 🎉")
         return
-
-    # Сортируем: сначала high, потом medium, потом low, потом без приоритета.
-    tasks_sorted = sorted(tasks, key=lambda t: PRIORITY_ORDER.get(t.get("priority"), 3))
-
-    blocks = []
-    current_priority = object()  # заведомо не совпадёт с первой задачей
-    block_lines = []
-    counter = 1
-    for t in tasks_sorted:
-        priority = t.get("priority")
-        if priority != current_priority:
-            if block_lines:
-                blocks.append("\n".join(block_lines))
-            current_priority = priority
-            emoji = PRIORITY_EMOJI.get(priority, "⚪️")
-            block_lines = [f"{emoji} *{PRIORITY_LABEL.get(priority, 'Без приоритета')}*"]
-        block_lines.append(f"{counter}. {t['text']}")
-        counter += 1
-    if block_lines:
-        blocks.append("\n".join(block_lines))
-
-    text = "\n\n".join(blocks)  # пустая строка = отступ между группами приоритетов
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(format_task_list(tasks), parse_mode="Markdown")
 
 
-# ---------- Обработка обычных сообщений ----------
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /check — прислать утреннюю рассылку прямо сейчас (для проверки)."""
+    await daily_job(context.application)
+
+
+# ---------- Обработка сообщений ----------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    log.info("Получено сообщение от chat_id=%s: %s", chat_id, text)
-
+    log.info("Сообщение от chat_id=%s: %s", chat_id, text)
     try:
-        await _handle_message_inner(update, context, chat_id, text)
+        await _handle(update, chat_id, text)
     except Exception:
         log.exception("Ошибка при обработке сообщения от chat_id=%s", chat_id)
+        await update.message.reply_text("Что-то пошло не так — попробуй ещё раз 🙏")
+
+
+async def _handle(update: Update, chat_id: int, text: str):
+    # 1) «задача ...» — добавить (проверяем первым, это команда).
+    if ADD_PREFIX.match(text):
+        rest = ADD_PREFIX.sub("", text, count=1).strip()
+        if not rest:
+            await update.message.reply_text("Напиши после слова «задача» саму задачу 🙂")
+            return
+        priority, clean = extract_priority(rest)
+        db.add_task(chat_id, clean, priority)
+        emoji = PRIORITY_EMOJI[priority]
+        label = PRIORITY_LABEL[priority].lower()
         await update.message.reply_text(
-            "Что-то пошло не так при обработке — попробуй ещё раз через минуту 🙏"
+            f"Записала задачу 👍 Приоритет: {label} {emoji}\n«{clean}»"
         )
-
-
-async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-
-    # Случай 1: ждём подтверждения гипотезы (да/нет на предложенный вариант).
-    if chat_id in AWAITING_HYPOTHESIS_CONFIRM:
-        task_id = AWAITING_HYPOTHESIS_CONFIRM.pop(chat_id)
-        task = db.get_task_by_id(task_id)
-        db.update_task(
-            task_id,
-            status="active",
-            clarifying_question=None,
-        )
-        await update.message.reply_text("Принято, добавила в список с этой оценкой 👍")
         return
 
-    # Случай 2: ждём ответа на уточняющий вопрос.
-    if chat_id in AWAITING_ANSWER:
-        task_id = AWAITING_ANSWER.pop(chat_id)
-        task = db.get_task_by_id(task_id)
-        hypothesis = await ai.propose_hypothesis(task["text"], text)
-        db.update_task(
-            task_id,
-            priority=hypothesis["priority"],
-            estimate_minutes=hypothesis["estimate_minutes"],
-        )
-        AWAITING_HYPOTHESIS_CONFIRM[chat_id] = task_id
-        await update.message.reply_text(hypothesis["hypothesis_text"])
-        return
-
-    # Случай 3: отметка "сделала ...".
-    lowered = text.lower()
-    if lowered.startswith("сделал") or lowered.startswith("готово") or lowered.startswith("выполнил"):
+    # 2) «сделала ...» — закрыть.
+    if DONE_PREFIX.match(text):
         open_tasks = db.get_open_tasks(chat_id)
         if not open_tasks:
             await update.message.reply_text("Сейчас в списке нет открытых задач 🤷")
             return
-        match = await ai.match_done_task(text, open_tasks)
+        match = find_done_task(text, open_tasks)
         if match:
             db.mark_task_done(match["id"])
-            await update.message.reply_text(f"Отлично, отметила «{match['text']}» как выполненную ✅")
+            await update.message.reply_text(f"Готово, закрыла «{match['text']}» ✅")
         else:
             await update.message.reply_text(
-                "Не нашла подходящую задачу в списке. Уточни, пожалуйста, какую именно задачу закрыть?"
+                "Не поняла, какую задачу закрыть. Напиши «сделала ...» "
+                "и пару слов из самой задачи."
             )
         return
 
-    # Случай 4: новая задача.
-    patterns = db.get_known_task_patterns(chat_id)
-    analysis = await ai.analyze_new_task(text, patterns)
-
-    task = db.add_task(chat_id, text)
-
-    if analysis.get("needs_clarification"):
-        question = analysis["question"]
-        db.update_task(task["id"], clarifying_question=question)
-        AWAITING_ANSWER[chat_id] = task["id"]
-        await update.message.reply_text(question)
-    else:
-        db.update_task(
-            task["id"],
-            status="active",
-            priority=analysis.get("priority"),
-            estimate_minutes=analysis.get("estimate_minutes"),
-        )
-        # Если нашли совпадение с типовой задачей — сохраним для обучения базы.
-        if not analysis.get("matched_pattern"):
-            db.add_known_task_pattern(
-                chat_id,
-                text,
-                analysis.get("estimate_minutes") or 0,
-                is_abstract=False,
-            )
-        await update.message.reply_text("Добавила задачу в список 👍")
+    # 3) Всё остальное за задачу НЕ принимаем — подсказываем.
+    await update.message.reply_text(
+        "Чтобы добавить задачу — начни сообщение со слова «задача».\n"
+        "Чтобы закрыть — со слова «сделала» и пары слов из задачи.\n"
+        "Список задач — команда /list."
+    )
 
 
 # ---------- Утренняя рассылка ----------
 
-async def send_daily_summary(application, chat_id: int):
-    pending = db.get_tasks_needing_review(chat_id)
-    open_tasks = [t for t in db.get_open_tasks(chat_id) if t["status"] == "active"]
-    summary = await ai.build_daily_summary(open_tasks, pending)
-    await application.bot.send_message(chat_id=chat_id, text=summary)
-
-
-async def daily_job(application, chat_ids: list[int]):
-    for chat_id in chat_ids:
+async def daily_job(application):
+    for chat_id in db.get_all_chat_ids():
         try:
-            await send_daily_summary(application, chat_id)
+            tasks = db.get_open_tasks(chat_id)
+            if not tasks:
+                continue
+            text = "Доброе утро! Вот задачи на сегодня:\n\n" + format_task_list(tasks)
+            await application.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         except Exception:
             log.exception("Не удалось отправить сводку для chat_id=%s", chat_id)
 
@@ -211,18 +249,12 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_tasks_command))
+    application.add_handler(CommandHandler("check", check_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Список ваших chat_id для рассылки. Сейчас бот один на один с вами —
-    # chat_id определится автоматически после первого /start, его можно
-    # прописать через переменную окружения ALLOWED_CHAT_ID на Railway.
-    allowed_chat_id = os.environ.get("ALLOWED_CHAT_ID")
-    chat_ids = [int(allowed_chat_id)] if allowed_chat_id else []
-
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
-    # Понедельник-пятница, в 11:00. Если нужно вторник-пятница — поменять day_of_week.
     scheduler.add_job(
-        lambda: application.create_task(daily_job(application, chat_ids)),
+        lambda: application.create_task(daily_job(application)),
         CronTrigger(day_of_week="tue-fri", hour=11, minute=0),
     )
     scheduler.start()
